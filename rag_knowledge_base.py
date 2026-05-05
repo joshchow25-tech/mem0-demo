@@ -25,6 +25,7 @@ from config import (
     RAG_TOP_K,
     RAG_CHUNK_SIZE,
     RAG_CHUNK_OVERLAP,
+    RAG_SCORE_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -266,18 +267,19 @@ class KnowledgeBase:
 
     def search(self, query: str, top_k: int = RAG_TOP_K) -> list[dict]:
         """
-        语义检索
+        语义检索，按相关度阈值过滤低质量结果
         :param query: 查询文本
-        :param top_k: 返回条数
-        :return: [{text, score, metadata}, ...]
+        :param top_k: 返回条数上限
+        :return: [{text, score, metadata}, ...]，按 score 降序
         """
         if self.collection.count() == 0:
             return []
 
         query_embedding = self.embedding.embed_one(query)
+        n_results = min(top_k * 2, self.collection.count())  # 多取一倍，过滤后再裁剪
         results = self.collection.query(
             query_embeddings=[query_embedding],
-            n_results=min(top_k, self.collection.count()),
+            n_results=n_results,
             include=["documents", "distances", "metadatas"],
         )
 
@@ -287,16 +289,32 @@ class KnowledgeBase:
             results["distances"][0],
             results["metadatas"][0],
         ):
+            score = round(1.0 - dist, 4)
+            if score < RAG_SCORE_THRESHOLD:
+                continue
             items.append({
                 "text": doc,
-                "score": round(1 - dist, 4),  # cosine distance → similarity
+                "score": score,
                 "metadata": meta,
             })
-        return items
+
+        # 按相关度降序，取前 top_k
+        items.sort(key=lambda x: x["score"], reverse=True)
+        filtered = items[:top_k]
+
+        logger.info(
+            f"[RAG检索] query='{query[:30]}' → 候选{n_results}条 → "
+            f"≥阈值{ RAG_SCORE_THRESHOLD}的有{len(items)}条 → 返回{len(filtered)}条"
+        )
+        return filtered
 
     def format_context(self, query: str, top_k: int = RAG_TOP_K) -> str:
         """检索并格式化为 Prompt 上下文"""
         results = self.search(query, top_k=top_k)
+        return self.format_context_from_results(results)
+
+    def format_context_from_results(self, results: list[dict]) -> str:
+        """直接格式化已检索好的结果（避免重复检索）"""
         if not results:
             return ""
         context_parts = []

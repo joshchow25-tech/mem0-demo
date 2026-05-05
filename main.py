@@ -10,11 +10,14 @@ FastAPI 后端接口
 - GET  /memory/{user_id}     - 查看用户记忆
 - DELETE /memory/{user_id}   - 清除用户记忆
 - GET  /health         - 健康检查
+- Telegram Bot（后台轮询，每个群对应一个 user_id）
 """
 import asyncio
 import logging
 import os
+import signal
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -24,10 +27,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
-from config import APP_HOST, APP_PORT, DEBUG
+from config import APP_HOST, APP_PORT, DEBUG, TELEGRAM_BOT_TOKEN
 from rag_knowledge_base import KnowledgeBase
 from memory_manager import MemoryManager
-from agent import CustomerServiceAgent
+from knowledge_agent import CustomerServiceAgent as KnowledgeAgent
+from merchant_agent import MerchantAgent
+from router_agent import OrchestratorAgent
 
 # ====================== 日志配置 ======================
 logging.basicConfig(
@@ -39,23 +44,59 @@ logger = logging.getLogger(__name__)
 # 全局单例
 kb: Optional[KnowledgeBase] = None
 mm: Optional[MemoryManager] = None
-agent: Optional[CustomerServiceAgent] = None
+agent: Optional[OrchestratorAgent] = None  # 统一入口（Orchestrator）
+_telegram_app = None  # Telegram bot Application 实例
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global kb, mm, agent
+    global kb, mm, agent, _telegram_app
     logger.info("初始化知识库...")
     kb = KnowledgeBase()
     logger.info("初始化记忆管理器...")
     mm = MemoryManager()
-    logger.info("初始化客服 Agent...")
-    agent = CustomerServiceAgent(kb, mm)
-    logger.info("✅ 服务启动完成")
+    logger.info("初始化知识库 Agent...")
+    knowledge_agent = KnowledgeAgent(kb, mm)
+    logger.info("初始化商户数据 Agent...")
+    merchant_agent = MerchantAgent(mm)
+    logger.info("初始化 Orchestrator（路由 Agent）...")
+    agent = OrchestratorAgent(knowledge_agent, merchant_agent)
+    logger.info("✅ 服务启动完成（多 Agent 架构）")
     # 后台异步写入演示知识（不阻塞启动）
     asyncio.create_task(_async_seed_demo_knowledge(kb))
+
+    # 启动 Telegram Bot（如果配置了 Token）
+    _telegram_app = None
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            from telegram_bot import build_bot_app
+            _telegram_app = build_bot_app(agent)
+            # 在后台线程启动 polling（不阻塞 FastAPI）
+            import subprocess, sys
+            def _start_bot():
+                logger.info("[Telegram] Bot 开始轮询...")
+                subprocess.Popen(
+                    [sys.executable, "-m", "telegram_bot"],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    env={**os.environ, "TELEGRAM_AS_PROCESS": "1"},
+                )
+                logger.info("[Telegram] Bot 进程已启动")
+            threading.Thread(target=_start_bot, daemon=True, name="tg-bot").start()
+        except Exception as e:
+            logger.warning(f"[Telegram] Bot 启动失败（已跳过）：{e}")
+    else:
+        logger.info("[Telegram] 未配置 TELEGRAM_BOT_TOKEN，跳过 Bot 启动")
+
     yield
+
+    # 关闭 Telegram Bot
+    if _telegram_app:
+        try:
+            await _telegram_app.shutdown()
+            logger.info("[Telegram] Bot 已关闭")
+        except Exception as e:
+            logger.warning(f"[Telegram] Bot 关闭异常：{e}")
     logger.info("服务关闭")
 
 
@@ -135,6 +176,8 @@ class ChatResponse(BaseModel):
     rag_sources: list[dict]
     memories_used: list[str]
     model: str
+    routed_to: Optional[list[str]] = None       # 路由目标列表：["knowledge"] / ["merchant"] / ["knowledge", "merchant"]
+    tools_called: Optional[list[dict]] = None  # 商户 Agent 调用的工具
 
 
 class AddTextRequest(BaseModel):
@@ -294,6 +337,88 @@ async def get_knowledge_chunks(source_name: str):
 
 # ====================== 记忆接口 ======================
 
+# ====================== Custom Instructions API ======================
+
+@app.get("/memory/strategy", tags=["Custom Instructions"])
+async def get_memory_strategy():
+    """
+    查看当前生效的记忆提取策略
+    :return: {"strategy": "customer_service"|"general"|"strict"|"custom", "instructions_preview": "..."}
+    """
+    if not mm:
+        raise HTTPException(status_code=503, detail="服务初始化中")
+    return mm.get_current_strategy()
+
+
+class StrategyRequest(BaseModel):
+    strategy: str = Field(..., description="策略名称：customer_service | general | strict")
+
+
+class InstructionsRequest(BaseModel):
+    instructions: str = Field(..., min_length=10, description="自定义指令全文")
+
+
+@app.put("/memory/strategy", tags=["Custom Instructions"])
+async def switch_memory_strategy(req: StrategyRequest):
+    """
+    切换记忆提取策略
+    - customer_service：客服场景（默认），专注订单/物流/售后/产品咨询
+    - general：通用场景，宽松提取用户偏好和重要信息
+    - strict：严格模式，只记录涉及金钱和法律承诺的内容
+    """
+    if not mm:
+        raise HTTPException(status_code=503, detail="服务初始化中")
+    ok = mm.switch_strategy(req.strategy)
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效策略：{req.strategy}，有效值：customer_service / general / strict",
+        )
+    return {"success": True, "strategy": req.strategy}
+
+
+@app.put("/memory/instructions", tags=["Custom Instructions"])
+async def set_custom_instructions(req: InstructionsRequest):
+    """
+    设置完全自定义的记忆提取指令（覆盖所有预设策略）
+    传入自定义的指令全文，会在 LLM 提取记忆时被使用
+    """
+    if not mm:
+        raise HTTPException(status_code=503, detail="服务初始化中")
+    mm.set_custom_instructions(req.instructions)
+    return {"success": True, "message": "自定义指令已更新，mem0 实例已重建"}
+
+
+@app.post("/memory/test-instructions", tags=["Custom Instructions"])
+async def test_custom_instructions(req: InstructionsRequest):
+    """
+    测试自定义指令效果
+    用指定的指令提取一条测试记忆，返回提取结果（不持久化）
+    """
+    if not mm:
+        raise HTTPException(status_code=503, detail="服务初始化中")
+    # 临时用指定指令构建 mem0 实例（只读，不影响全局状态）
+    from memory_manager import build_mem0_config, Memory
+    config = build_mem0_config(custom_instructions=req.instructions)
+    tmp_memory = Memory.from_config(config)
+    test_messages = [
+        {"role": "user", "content": "我叫李明，手机号13800138000，上周买了一件红色T恤（订单号#98765）还没收到。"}
+    ]
+    try:
+        result = tmp_memory.add(messages=test_messages, user_id="test_user")
+        facts = result.get("results", [])
+        return {
+            "success": True,
+            "instructions_preview": req.instructions[:300] + "..." if len(req.instructions) > 300 else req.instructions,
+            "extracted_facts": facts,
+            "fact_count": len(facts),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"测试失败：{str(e)}")
+
+
+# ====================== 记忆 CRUD ======================
+
 @app.get("/memory/{user_id}/{memory_id}/history", tags=["记忆"])
 async def get_memory_history(user_id: str, memory_id: str):
     """获取单条记忆的变更历史"""
@@ -358,17 +483,34 @@ async def clear_user_memory(user_id: str):
     return {"success": success, "user_id": user_id}
 
 
+# ====================== 用户列表 ======================
+
+@app.get("/users", tags=["用户"])
+async def list_users():
+    """
+    列出所有有记忆数据的 user_id
+    - 从对话存档 ChromaDB 中扫描 user_id 元数据
+    """
+    if not mm:
+        raise HTTPException(status_code=503, detail="服务初始化中")
+    users = mm.list_all_users()
+    return {"user_count": len(users), "users": users}
+
+
 # ====================== 健康检查 ======================
 
 @app.get("/health", tags=["系统"])
 async def health():
     return {
         "status": "ok",
+        "architecture": "multi-agent",
         "knowledge_chunks": kb.count() if kb else 0,
         "services": {
             "knowledge_base": kb is not None,
             "memory_manager": mm is not None,
-            "agent": agent is not None,
+            "orchestrator": agent is not None,
+            "knowledge_agent": agent is not None and agent.knowledge is not None,
+            "merchant_agent": agent is not None and agent.merchant is not None,
         },
     }
 

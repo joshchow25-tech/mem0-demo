@@ -114,6 +114,32 @@
     }
     .user-id-input:focus { border-color: var(--primary); }
 
+    .user-list {
+      max-height: 140px;
+      overflow-y: auto;
+    }
+    .user-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 8px;
+      font-size: 12px;
+      color: var(--text);
+      cursor: pointer;
+      border-radius: 6px;
+      transition: background 0.15s;
+      word-break: break-all;
+    }
+    .user-item:hover { background: #ede9fe; }
+    .user-item.active { background: #ede9fe; color: #6d28d9; font-weight: 600; }
+    .user-item .u-dot {
+      width: 6px; height: 6px;
+      background: #6366f1;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .no-users { font-size: 12px; color: var(--muted); text-align: center; padding: 8px 0; }
+
     .kb-list {
       list-style: none;
       max-height: 200px;
@@ -605,6 +631,16 @@
       </div>
 
       <div class="sidebar-section" style="border-top:1px solid var(--border)">
+        <div class="sidebar-title" style="display:flex;justify-content:space-between;align-items:center">
+          <span>用户列表 <span id="user-count" style="color:var(--primary)"></span></span>
+          <button class="btn-icon" onclick="loadUserList()" title="刷新用户列表" style="background:rgba(99,102,241,0.08);color:var(--primary);font-size:12px;padding:3px 8px;border-radius:6px">🔄</button>
+        </div>
+        <div id="user-list" class="user-list">
+          <div class="no-memory">加载中...</div>
+        </div>
+      </div>
+
+      <div class="sidebar-section" style="border-top:1px solid var(--border)">
         <div class="sidebar-title">知识库 <span id="kb-count" style="color:var(--primary)"></span></div>
         <ul class="kb-list" id="kb-list"></ul>
         <button class="upload-btn" onclick="document.getElementById('file-input').click()">
@@ -744,8 +780,58 @@ let conversationHistory = [];
 // ======== 初始化 ========
 window.onload = () => {
   loadKnowledgeSources();
+  loadUserList();
   loadMemory();
 };
+
+// ======== 用户列表 ========
+
+async function loadUserList() {
+  const listEl = document.getElementById('user-list');
+  listEl.innerHTML = '<div class="no-users">加载中...</div>';
+  try {
+    const resp = await fetch(`${API}/users`);
+    if (!resp.ok) {
+      listEl.innerHTML = '<div class="no-users">加载失败</div>';
+      return;
+    }
+    const data = await resp.json();
+    const countEl = document.getElementById('user-count');
+    countEl.textContent = `(${data.user_count})`;
+
+    if (!data.users || data.users.length === 0) {
+      listEl.innerHTML = '<div class="no-users">暂无用户记录</div>';
+      return;
+    }
+
+    const currentUid = getUserId();
+    listEl.innerHTML = data.users.map(uid => {
+      const isActive = uid === currentUid ? ' active' : '';
+      const displayName = uid.startsWith('telegram_')
+        ? `📱 ${uid.replace('telegram_', 'TG:')}`
+        : uid.startsWith('telegram_group_')
+        ? `👥 ${uid.replace('telegram_group_', '群:')}`
+        : `👤 ${uid}`;
+      return `<div class="user-item${isActive}" data-uid="${escapeAttr(uid)}" onclick="selectUser('${escapeJs(uid)}')">
+        <div class="u-dot"></div>
+        <span title="${escapeAttr(uid)}">${displayName}</span>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    listEl.innerHTML = '<div class="no-users">加载失败</div>';
+  }
+}
+
+function selectUser(uid) {
+  // 设置 user-id input 并触发记忆刷新
+  document.getElementById('user-id').value = uid;
+  // 高亮选中的用户（用 data-uid 精确匹配）
+  document.querySelectorAll('.user-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.uid === uid);
+  });
+  loadMemory();
+  showToast(`已切换到用户：${uid}`);
+}
 
 function getUserId() {
   return document.getElementById('user-id').value.trim() || 'default_user';
