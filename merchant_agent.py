@@ -12,14 +12,13 @@
   GET  /inventory/{product_id}     - 查库存
   GET  /logistics/{tracking_no}    - 查物流
 
-所有接口未实现时返回 Mock 数据（方便开发调试）。
+所有接口通过 HTTP 调用真实业务系统。
 """
 import base64
 import hashlib
 import hmac
 import json
 import logging
-import time
 import httpx
 from typing import Optional
 
@@ -347,8 +346,8 @@ MERCHANT_SYSTEM_PROMPT = """你是商户数据查询助手，专门负责查询�
 class MerchantAPIClient:
     """
     商户业务接口客户端
-    - 真实模式：调用 MERCHANT_API_BASE_URL 配置的接口，使用签名鉴权
-    - Mock 模式：接口不可达时自动返回模拟数据（方便本地开发）
+    - 调用 MERCHANT_API_BASE_URL 配置的接口，使用签名鉴权
+    - 接口不可达时抛出异常，由上层处理
     """
 
     def __init__(self):
@@ -373,149 +372,26 @@ class MerchantAPIClient:
             self._fallback_headers["Authorization"] = f"Bearer {MERCHANT_API_TOKEN}"
 
     def _get(self, path: str, params: dict = None) -> dict:
-        """发起 GET 请求，失败时返回 Mock 数据"""
-        try:
-            if self._http:
-                return self._http.get(path, params)
-            # 降级：Bearer Token 模式
-            url = f"{self.base_url}{path}"
-            with httpx.Client(timeout=self.timeout) as client:
-                resp = client.get(url, params=params, headers=self._fallback_headers)
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as e:
-            logger.warning(f"[MerchantAPI] 请求失败（{self.base_url}{path}），使用 Mock 数据：{e}")
-            return self._mock(path, params or {})
+        """发起 GET 请求"""
+        if self._http:
+            return self._http.get(path, params)
+        # 降级：Bearer Token 模式
+        url = f"{self.base_url}{path}"
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.get(url, params=params, headers=self._fallback_headers)
+            resp.raise_for_status()
+            return resp.json()
 
     def _post(self, path: str, params: dict = None, json_body: dict = None) -> dict:
-        """发起 POST 请求，失败时返回 Mock 数据"""
-        try:
-            if self._http:
-                return self._http.post(path, params, json_body)
-            # 降级：Bearer Token 模式
-            url = f"{self.base_url}{path}"
-            with httpx.Client(timeout=self.timeout) as client:
-                resp = client.post(url, params=params, json=json_body, headers=self._fallback_headers)
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as e:
-            logger.warning(f"[MerchantAPI] POST 请求失败（{self.base_url}{path}），使用 Mock 数据：{e}")
-            return self._mock_post(path, json_body or {})
-
-    def _mock(self, path: str, params: dict) -> dict:
-        """Mock 数据生成器"""
-        if "/orders/" in path:
-            order_id = path.split("/orders/")[-1]
-            return {
-                "order_id": order_id,
-                "status": "shipped",
-                "status_desc": "已发货",
-                "created_at": "2024-05-01 10:30:00",
-                "items": [{"name": "商品A", "qty": 2, "price": 99.0}],
-                "total_amount": 198.0,
-                "receiver": "张*（138****0000，北京市朝阳区**路**号）",
-                "logistics": {"carrier": "顺丰", "tracking_no": "SF1234567890"},
-                "_mock": True,
-            }
-        elif "/orders" in path:
-            return {
-                "user_id": params.get("user_id", ""),
-                "total": 3,
-                "orders": [
-                    {"order_id": "ORD20240501001", "status": "delivered", "total": 198.0, "created_at": "2024-05-01"},
-                    {"order_id": "ORD20240410002", "status": "delivered", "total": 88.0, "created_at": "2024-04-10"},
-                    {"order_id": "ORD20240301003", "status": "cancelled", "total": 150.0, "created_at": "2024-03-01"},
-                ],
-                "_mock": True,
-            }
-        elif "/users/" in path:
-            return {
-                "user_id": path.split("/users/")[-1],
-                "nickname": "用户昵称",
-                "level": "金卡会员",
-                "points": 2580,
-                "registered_at": "2023-01-15",
-                "phone": "138****0000",
-                "_mock": True,
-            }
-        elif "/logistics/" in path:
-            tracking_no = path.split("/logistics/")[-1]
-            return {
-                "tracking_no": tracking_no,
-                "carrier": "顺丰速运",
-                "status": "运输中",
-                "estimated_delivery": "明天 18:00 前",
-                "tracks": [
-                    {"time": "2024-05-03 14:00", "desc": "已到达北京转运中心"},
-                    {"time": "2024-05-02 22:30", "desc": "已从上海发出"},
-                    {"time": "2024-05-02 16:00", "desc": "已揽件"},
-                ],
-                "_mock": True,
-            }
-        elif "/products/" in path:
-            return {
-                "product_id": path.split("/products/")[-1],
-                "name": "示例商品",
-                "price": 99.0,
-                "stock": 256,
-                "status": "on_sale",
-                "specs": {"颜色": ["红", "蓝", "白"], "尺码": ["S", "M", "L", "XL"]},
-                "_mock": True,
-            }
-        elif "/refund/" in path or "refund" in path:
-            return {
-                "order_id": params.get("order_id", ""),
-                "refund_status": "processing",
-                "refund_status_desc": "退款审核中",
-                "applied_at": "2024-05-01 09:00",
-                "estimated_days": "3-5 个工作日",
-                "_mock": True,
-            }
-        elif "/api/v1/institution/card/type" in path:
-            return {
-                "code": 0,
-                "msg": "success",
-                "data": [
-                    {"id": 1, "name": "Visa Classic", "status": "ACTIVE"},
-                    {"id": 2, "name": "Visa Gold", "status": "ACTIVE"},
-                    {"id": 3, "name": "MasterCard Standard", "status": "ACTIVE"},
-                    {"id": 4, "name": "UnionPay Standard", "status": "ACTIVE"},
-                ],
-                "_mock": True,
-            }
-        elif "/api/v1/institution/balance" in path:
-            return {
-                "code": 0,
-                "msg": "success",
-                "data": [
-                    {"currency": "USD", "available": "10000.00", "frozen": "0.00"},
-                    {"currency": "USDT", "available": "5000.00", "frozen": "200.00"},
-                ],
-                "_mock": True,
-            }
-        elif "/api/v1/customers/accounts" in path:
-            acct_no = params.get("acct_no", "")
-            return {
-                "code": 0,
-                "msg": "success",
-                "data": [
-                    {"acct_no": acct_no or "ACC0001", "name": "测试用户", "status": "ACTIVE", "balance": "500.00", "currency": "USD"},
-                ],
-                "_mock": True,
-            }
-        return {"error": "未知接口", "path": path, "_mock": True}
-
-    def _mock_post(self, path: str, body: dict) -> dict:
-        """POST 请求的 Mock 数据"""
-        if "/refund_apply" in path or "refund" in path:
-            return {
-                "order_id": body.get("order_id", ""),
-                "refund_id": "RF" + str(int(time.time()))[-8:],
-                "status": "submitted",
-                "status_desc": "退款申请已提交",
-                "_mock": True,
-            }
-        return {"error": "未知 POST 接口", "path": path, "_mock": True}
+        """发起 POST 请求"""
+        if self._http:
+            return self._http.post(path, params, json_body)
+        # 降级：Bearer Token 模式
+        url = f"{self.base_url}{path}"
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.post(url, params=params, json=json_body, headers=self._fallback_headers)
+            resp.raise_for_status()
+            return resp.json()
 
     # ---------- 各工具对应的方法 ----------
 
@@ -612,10 +488,6 @@ class MerchantAgent:
                 result = self.api.query_customer_accounts(args.get("acct_no"))
             else:
                 result = {"error": f"未知工具：{tool_name}"}
-
-            is_mock = result.pop("_mock", False)
-            if is_mock:
-                result["_note"] = "（当前为 Mock 数据，业务接口未连接）"
 
             return json.dumps(result, ensure_ascii=False, indent=2)
         except Exception as e:

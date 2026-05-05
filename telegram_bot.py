@@ -8,7 +8,7 @@ Telegram Bot 集成
 import asyncio
 import logging
 import re
-from typing import Optional
+from typing import Optional, Union
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 from knowledge_agent import CustomerServiceAgent
+from router_agent import OrchestratorAgent
 from config import TELEGRAM_BOT_TOKEN
 
 logger = logging.getLogger(__name__)
@@ -267,7 +268,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
 async def _do_reply(msg, user_id: str, user_text: str, bot, context: ContextTypes.DEFAULT_TYPE):
     """统一的回复逻辑（群聊/私聊共用）"""
-    agent: Optional[CustomerServiceAgent] = context.bot_data.get("agent")
+    agent: Optional[Union[CustomerServiceAgent, OrchestratorAgent]] = context.bot_data.get("agent")
     if not agent:
         await msg.reply_text("⚠️ Agent 未初始化，请联系管理员。")
         return
@@ -302,7 +303,7 @@ async def _do_reply(msg, user_id: str, user_text: str, bot, context: ContextType
 
 # ====================== Bot 构建 ======================
 
-def build_bot_app(agent: CustomerServiceAgent):
+def build_bot_app(agent: Union[CustomerServiceAgent, OrchestratorAgent]):
     """构建 Telegram Application，注入 agent"""
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN 未配置，请在 .env 中设置")

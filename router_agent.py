@@ -159,31 +159,30 @@ class OrchestratorAgent:
         """
         targets = self._route(user_input)
 
-        # 辅助方法：调用单个 Agent
-        def call_agent(name: str):
-            if name == "merchant":
-                return self.merchant.chat(
-                    user_input=user_input,
-                    user_id=user_id,
-                    conversation_history=conversation_history,
-                    update_memory=False,
-                )
-            else:
-                return self.knowledge.chat(
-                    user_input=user_input,
-                    user_id=user_id,
-                    conversation_history=conversation_history,
-                    update_memory=False,
-                )
-
-        # 串行调用
+        # 串行调用（只在最后一个 Agent 更新记忆，避免重复写入）
         answers: list[str] = []
         all_rag_sources: list[dict] = []
         all_memories: list[str] = []
         all_tools: list[dict] = []
 
-        for name in targets:
-            result = call_agent(name)
+        for i, name in enumerate(targets):
+            should_update_memory = update_memory and (i == len(targets) - 1)
+
+            if name == "merchant":
+                result = self.merchant.chat(
+                    user_input=user_input,
+                    user_id=user_id,
+                    conversation_history=conversation_history,
+                    update_memory=should_update_memory,
+                )
+            else:
+                result = self.knowledge.chat(
+                    user_input=user_input,
+                    user_id=user_id,
+                    conversation_history=conversation_history,
+                    update_memory=should_update_memory,
+                )
+
             answers.append(result.get("answer", ""))
             all_rag_sources.extend(result.get("rag_sources", []))
             all_memories.extend(result.get("memories_used", []))
@@ -192,13 +191,6 @@ class OrchestratorAgent:
 
         # 合并答案（去重 + 自然段落拼接）
         final_answer = self._merge_answers(answers)
-
-        # 只在最后一个 Agent 更新记忆（避免重复写入）
-        if update_memory and targets:
-            last_agent = targets[-1]
-            call_agent(last_agent)  # 重新调用以触发记忆更新（可优化为 expose 内部方法）
-            # 简化：直接用最后一个 Agent 的结果
-            pass
 
         return {
             "answer": final_answer,
