@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 import httpx
 from typing import Optional
 
@@ -77,21 +78,28 @@ class MerchantHttpClient:
         method: str,
         path: str,
         query_str: str,
-        body: Optional[str],
+        body: Optional[dict],
         api_key: str,
         api_secret: str,
     ) -> str:
         """
-        生成签名字符串，与 Java SDK HmacSHA256Base64Util.sign() 一致：
-        timestamp + method(大写) + apiKey + requestPath + queryString + body
+        生成签名字符串，与 Java SDK HmacSHA256Base64Util.sign() 完全一致：
+        preHash = timestamp + method(大写) + apiKey + requestPath + [?queryString] + [body参数]
+
+        body 参数处理（对应 Java appendBody）：
+          - body dict 按 key 字母升序排列（等价于 TreeMap）
+          - 拼接为 key=value&key=value 格式（末尾无 &）
+          - 而非 JSON 字符串
         """
-        # Java SDK 顺序：timestamp + method + appKey + requestPath + queryString + body
         parts = [timestamp, method.upper(), api_key, path]
         if query_str:
             parts.append("?" + query_str)
         if body:
-            parts.append(body)
+            # 按 key 字母升序排序，拼接为 key=value&key=value
+            body_str = "&".join(f"{k}={v}" for k, v in sorted(body.items()))
+            parts.append(body_str)
         sign_string = "".join(parts)
+        logger.debug(f"[MerchantHttp] 签名原文: {sign_string}")
         sig = hmac.new(
             api_secret.encode("utf-8"),
             sign_string.encode("utf-8"),
@@ -135,12 +143,12 @@ class MerchantHttpClient:
         POST 请求
         - path: API 路径
         - params: 查询参数 dict
-        - json_body: JSON 请求体 dict
+        - json_body: JSON 请求体 dict（签名时按 key 升序转 key=value&... 格式，HTTP body 仍发 JSON）
         """
         timestamp = str(int(time.time() * 1000))
         query_str = self._build_query_str(params)
-        body_str = json.dumps(json_body) if json_body else ""
-        signature = self._sign(timestamp, "POST", path, query_str, body_str, self.api_key, self.api_secret)
+        # 签名时传 dict，由 _sign 内部转 key=value&key=value（与 Java TreeMap+appendBody 一致）
+        signature = self._sign(timestamp, "POST", path, query_str, json_body, self.api_key, self.api_secret)
 
         headers = {
             "Content-Type": "application/json",
@@ -149,7 +157,7 @@ class MerchantHttpClient:
         }
 
         url = f"{self.base_url}{path}"
-        logger.info(f"[MerchantHttp] POST {url} body={body_str[:200]}")
+        logger.info(f"[MerchantHttp] POST {url} body={json.dumps(json_body)[:200]}")
 
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(url, params=params, json=json_body, headers=headers)
@@ -319,6 +327,23 @@ MERCHANT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_bank_balance",
+            "description": "查询银行卡余额信息，根据卡号返回该卡的余额详情。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "card_no": {
+                        "type": "string",
+                        "description": "银行卡号，必填",
+                    }
+                },
+                "required": ["card_no"],
+            },
+        },
+    },
 ]
 
 
@@ -429,6 +454,10 @@ class MerchantAPIClient:
         params = {"acct_no": acct_no} if acct_no else None
         return self._get("/api/v1/customers/accounts", params=params)
 
+    def query_bank_balance(self, card_no: str) -> dict:
+        body = {"card_no": card_no}
+        return self._post("/api/v1/bank/balance", json_body=body)
+
 
 # ====================== Merchant Agent ======================
 
@@ -486,6 +515,8 @@ class MerchantAgent:
                 result = self.api.query_balance()
             elif tool_name == "query_customer_accounts":
                 result = self.api.query_customer_accounts(args.get("acct_no"))
+            elif tool_name == "query_bank_balance":
+                result = self.api.query_bank_balance(args["card_no"])
             else:
                 result = {"error": f"未知工具：{tool_name}"}
 
